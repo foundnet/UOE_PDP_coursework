@@ -92,8 +92,8 @@ int masterPoll()
 			if (in_command.command == PP_SLEEPING)
 			{
 				if (PP_DEBUG)
-					printf("[Master] Received sleep command from %d\n", status.MPI_SOURCE);
-				PP_active[status.MPI_SOURCE - 1] = 0;
+					printf("[Master] Received sleep command from %d\n", PP_status.MPI_SOURCE);
+				PP_active[PP_status.MPI_SOURCE - 1] = 0;
 			}
 
 			if (in_command.command == PP_RUNCOMPLETE)
@@ -108,12 +108,12 @@ int masterPoll()
 				PP_processesAwaitingStart++;
 			}
 
-			int returnRank = startAwaitingProcessesIfNeeded(PP_processesAwaitingStart, status.MPI_SOURCE);
+			int returnRank = startAwaitingProcessesIfNeeded(PP_processesAwaitingStart, PP_status.MPI_SOURCE);
 
 			if (in_command.command == PP_STARTPROCESS)
 			{
 				// If the master was to start a worker then send back the process rank that this worker is now on
-				MPI_Send(&returnRank, 1, MPI_INT, status.MPI_SOURCE, PP_PID_TAG, MPI_COMM_WORLD);
+				MPI_Send(&returnRank, 1, MPI_INT, PP_status.MPI_SOURCE, PP_PID_TAG, MPI_COMM_WORLD);
 			}
 			MPI_Irecv(&in_command, 1, PP_COMMAND_TYPE, MPI_ANY_SOURCE, PP_CONTROL_TAG, MPI_COMM_WORLD, &PP_request);
  			MPI_Test(&PP_request, &flag, &PP_status);

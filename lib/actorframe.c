@@ -2,166 +2,7 @@
 #include <stdio.h>
 #include "mpi.h"
 #include "pool.h"
-
-//---------------------------------------------------------------------------
-// Macros
-//---------------------------------------------------------------------------
-
-#define MAX_ACTOR_CNT 200
-#define MAX_ACTOR_TYPES 10
-#define MAX_NODE_CNT 100
-#define ACTOR_MSGQUEUE_LEN 100
-
-#define AF_CONTROL_TAG 10000
-#define AF_ACTORMSG_TAG 10001
-
-//---------------------------------------------------------------------------
-// Definitions
-//---------------------------------------------------------------------------
-
-
-//The actor states
-typedef enum _ActorState { AS_Ready,
-                           AS_Running,
-                           AS_Suspended,
-                           AS_Stopped,
-                           AS_Cleaned } ActorState;
-
-//The assign strategy of the actors: OnePerNode-One actor per node, Even-Assign the actors to nodes evenly
-//                                   MaxInNode-Assign to one node till reach its limitation,then next node
-//                                   Zero-Don't assign automatically, maybe assign manually later.
-typedef enum _AssignMethod { AM_OnePerNode,
-                             AM_Even,
-                             AM_MaxInNode,
-                             AM_Zero } AssignMethod;
-
-typedef enum _FrameState { FS_New,
-                           FS_Ready,
-                           FS_Init,
-                           FS_Running,
-                           FS_Stopped } FrameState;
-
-typedef enum _FrameMsgType { FM_ActorNew,
-                             FM_ActorDie,
-                             FM_ActorRun,
-                             FM_ActorSuspend } FrameMsgType;
-
-// Actor Message Structure
-typedef struct _FrameMessage
-{
-    FrameMsgType msgType;
-    int targetActor;           //And if the lower 16 bots is 0 , means this should be adopted on every actor in the node
-    unsigned char data[32];
-} FrameMessage;
-
-typedef struct _ActorMessage
-{
-    int sndActorID; //If the lower 16 bits is 0, means it's sent by a node.
-    int rcvActorID; //And if it's 0 , means a broadcast, every actor should process it.
-    int msgCatogory;         //Defined by the user
-    int bodyLength;
-    unsigned char body[256];
-} ActorMessage ;
- 
-// Actor Message Round Buffer
-typedef struct _MsgRoundBuf
-{
-    int head;
-    int tail;
-    ActorMessage msg[ACTOR_MSGQUEUE_LEN];
-} MsgRoundBuf ;
-
-// Actor Structure
-typedef struct _Actor
-{
-    unsigned actorID;  //Generated automatically Higher 16 bit - node number , lower 16 bit - actor number
-    char category[10]; //The category of an actor, assigned by framework when create this actor.
-    int categorySeq;   //The global sequece of a actor in the same category.
-    long step;         //The current step number.
-    ActorState state;
-    MsgRoundBuf msgQueue; //The message round buffer queue that belong to the Actor.
-    int (*Run)();
-    int (*Init)(void *initData, int length);
-    int (*Destroy)();
-    void *pActorData;
-    Actor *pNext;
-} Actor;
-
-// Actor description, used when config the framework
-typedef struct _ActorDesc
-{
-    char category[10]; //The category of an actor, assigned by framework when create this actor.
-    int (*Run)();
-    int (*Init)();
-    int (*Destroy)();
-    int actorinNode;
-    int actorCount; //The actor count when initialize.
-    int nodelimit;  //How many nodes can be used in total, if this value < 0, means infinity.
-    int actorlimit; //How many actors can be assigned in a node.
-    int actorsBuilt;
-    AssignMethod method;
-} ActorDesc;
-
-// Framework description, used when config the framework
-typedef struct _FrameDesc
-{
-    int (*Initialize)();
-    int (*Finalize)();
-    int (*MasterRun)();
-    int (*WorkerRun)();
-} FrameDesc;
-
-// Actor and node mapping table of the whole program.
-typedef struct _NodeMappingTable
-{
-    int actorID;
-    int node;
-    char category[10];
-    int categorySeq;
-} NodeMappingTable;
-
-//The handle of the actor
-typedef struct _ActorFrameworkHandle
-{
-    // Actor queue, acturally is the place that save the actor's personal data and function pointer
-    FrameState state;
-    Actor *pActorQueue;
-    NodeMappingTable mapTable[MAX_ACTOR_CNT];
-    int mapTableCnt;
-    int actortypes;
-    FrameDesc frame;
-    ActorDesc actorinfo[MAX_ACTOR_TYPES];
-    int actorinNode[MAX_NODE_CNT];
-    int activeNodeCnt;
-
-    int rank;
-    int ranksize;
-} ActorFrameworkHandle;
-
-//---------------------------------------------------------------------------
-// Variables
-//---------------------------------------------------------------------------
-static ActorFrameworkHandle handleGlobal;
-
-
-MPI_Request cntlRequest = NULL;
-FrameMessage cntlMessage;
-
-MPI_Request actorRequest = NULL;
-ActorMessage actorMessage;
-
-MPI_Request cntlBcastRequest = NULL;
-FrameMessage cntlBcastMessage;
-
-MPI_Request actorBcastRequest = NULL;
-ActorMessage actorBcastMessage;
-
-MPI_Status status;
-
-static MPI_Datatype AF_CNTL_TYPE;
-static MPI_Datatype AF_ACTOR_TYPE;
-
-
+#include "actorframe.h"
 
 //---------------------------------------------------------------------------
 // Functions
@@ -174,7 +15,7 @@ void CreateFrameMsgType() {
 	MPI_Address(&msg.msgType, &addr[0]);
 	MPI_Address(&msg.targetActor, &addr[1]);
 	MPI_Address(&msg.data, &addr[2]);
-    int blocklengths[3] = {1,1,16}, nitems=3;
+    int blocklengths[3] = {1,1,64}, nitems=3;
 	MPI_Datatype types[3] = {MPI_INT, MPI_INT, MPI_CHAR};
 	MPI_Aint offsets[3] = {0, addr[1]-addr[0],addr[2]-addr[1]};
 	MPI_Type_create_struct(nitems, blocklengths, offsets, types, &AF_CNTL_TYPE);
@@ -189,7 +30,7 @@ void CreateActorMsgType() {
 	MPI_Address(&msg.msgCatogory, &addr[2]);
 	MPI_Address(&msg.bodyLength, &addr[3]);
     MPI_Address(&msg.body, &addr[4]);
-    int blocklengths[5] = {1,1,1,1,64}, nitems=5;
+    int blocklengths[5] = {1,1,1,1,256}, nitems=5;
 	MPI_Datatype types[5] = {MPI_INT, MPI_INT, MPI_INT, MPI_INT, MPI_CHAR};
 	MPI_Aint offsets[5] = {0, addr[1]-addr[0],addr[2]-addr[1],addr[3]-addr[2],addr[4]-addr[3]};
 	MPI_Type_create_struct(nitems, blocklengths, offsets, types, &AF_ACTOR_TYPE);
@@ -198,18 +39,92 @@ void CreateActorMsgType() {
 
 
 
+int BroadcastCntlMessage(FrameMsgType msgType, int actor, void *pData, int dataLen)
+{
+    if (handleGlobal.rank == 0 && dataLen <= 32 && dataLen >=0)
+    {
+        FrameMessage msg;
+        memset (msg.data, 0, 32);
+        msg.msgType = msgType;
+        msg.targetActor = actor;
+        memcpy (msg.data, pData, dataLen);
+
+        MPI_Request request;
+        MPI_Ibcast(&msg, 1, AF_CNTL_TYPE, 0, MPI_COMM_WORLD, &request);
+
+        return 1;
+    }
+
+    return 0;
+}
+
+
+int SendActorMessage(Actor *this, int destID, int msgType, void *pData, int dataLen)
+{
+    int node = destID >> 16;
+    if (handleGlobal.rank != node && dataLen <= 128 && dataLen >=0)
+    {
+        ActorMessage msg;
+        memset (msg.body, 0, 128);
+        msg.msgCatogory = msgType;
+        msg.bodyLength = dataLen;
+        msg.rcvActorID = destID;
+        msg.sndActorID = this->actorID;
+        memcpy (msg.body, pData, dataLen);
+
+        MPI_Request request;
+        int node = destID >> 16;
+
+        MPI_Send(&msg,1,AF_ACTOR_TYPE, node , AF_ACTORMSG_TAG,MPI_COMM_WORLD);
+    }    
+    return 1;
+}
+
+
+
+int SendCntlMessage(FrameMsgType msgType, int node, int actor, void *pData, int dataLen)
+{
+    if (handleGlobal.rank != node && dataLen <= 32 && dataLen >=0)
+    {
+        FrameMessage msg;
+        memset (msg.data, 0, 32);
+        msg.msgType = msgType;
+        msg.targetActor = actor;
+        memcpy (msg.data, pData, 32);
+
+        MPI_Request request;
+
+        MPI_Bsend(&msg,1,AF_CNTL_TYPE,node,AF_CONTROL_TAG,MPI_COMM_WORLD);
+    }    
+    return 1;
+}
+
+int ReadActorMessage(Actor *actor, ActorMessage *outMsg)
+{
+    if (actor != NULL)
+    {
+        if (actor->msgQueue.tail != actor->msgQueue.head)
+        {
+            memcpy(outMsg, &actor->msgQueue.msg[actor->msgQueue.tail],sizeof(ActorMessage));
+            int point = (actor->msgQueue.tail + 1) % ACTOR_MSGQUEUE_LEN;
+            actor->msgQueue.tail = point;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int FinalizeActorFramwork()
+{
+    return 1;
+}
+
+
 /** 
  * @brief Config the Actor Framework, includes：
  *          The strategy of actor assignment   One actor per node, or even mode/Multi actors one node, given the maximum actors per node and init nodes 
  *          The initialize count of actors in total
  *          The function pointer of framework should call when initialize and finalize.
- *        
- * @param index    参数1
- * @param t            参数2 @see CTest
- *
- * @return 返回说明
- *        -<em>false</em> fail
- *        -<em>true</em> succeed
 */
 int ConfigActorFrame(FrameDesc desc)
 {
@@ -227,13 +142,6 @@ int ConfigActorFrame(FrameDesc desc)
 /** 
  * @brief Add the actor's profile, including the actor's type, personal data, strategy, function pointer, etc.
  *        The function pointer includes the init 
- *        
- * @param index    参数1
- * @param t            参数2 @see CTest
- *
- * @return 返回说明
- *        -<em>false</em> fail
- *        -<em>true</em> succeed
 */
 int AddActorProfile(ActorDesc desc)
 {
@@ -264,7 +172,6 @@ void DeleteHandle()
 // Build the mapTable and create actor queue, if faied, return 0 , or return the count of the active nodes.
 int BuildMapTable()
 {
-
     memset(handleGlobal.mapTable, 0, sizeof(NodeMappingTable) * MAX_ACTOR_CNT);
     handleGlobal.mapTableCnt = 0;
 
@@ -320,65 +227,18 @@ int BuildMapTable()
                         memcpy((*pActor)->category,handleGlobal.mapTable[handleGlobal.mapTableCnt].category, 10);
                         (*pActor)->pActorData = NULL;
                         (*pActor)->msgQueue.head = 0;
-                        (*pActor)->msgQueue.tail = -1;
-                        (*pActor)->pNext = NULL;
-                        (*pActor)->step = 0;
-                        (*pActor)->state = AS_Ready;
-                        pActor = &(*pActor)->pNext ;
-                        (*pActor)->Init(NULL,0);                        
-                    }
-                    handleGlobal.mapTableCnt++;
-                    handleGlobal.actorinNode[n]++;
-
-                }
-            }
-        }
-        else if (pDesc->method == AM_MaxInNode)
-        {
-            nodeCnt = pDesc->actorCount / pDesc->actorlimit + (pDesc->actorCount % pDesc->actorlimit) >0 ? 1:0;
-            if (pDesc->nodelimit >= 0)  
-            {
-                if (nodeCnt < pDesc->nodelimit || nodeCnt < (handleGlobal.ranksize - 1))
-                {
-                    errMessage("No enough node for actors.");
-                    DeleteHandle();
-                    return 0;
-                }
-            }
-            activeNodeCnt = activeNodeCnt > nodeCnt ? activeNodeCnt : nodeCnt;
-
-            for (int n = 1; n <= nodeCnt; n++)
-            {
-                actorCnt = (n <= pDesc->actorCount / pDesc->actorlimit)? pDesc->actorlimit:pDesc->actorCount % pDesc->actorlimit;
-                //Build the maptable
-                for (int m = 0; m < actorCnt; m++)
-                {
-                    pDesc->actorsBuilt++;
-                    handleGlobal.mapTable[handleGlobal.mapTableCnt].actorID = n << 16 + handleGlobal.mapTableCnt + 1;
-                    memcpy(handleGlobal.mapTable[handleGlobal.mapTableCnt].category, pDesc->category, 10);
-                    handleGlobal.mapTable[handleGlobal.mapTableCnt].categorySeq = pDesc->actorsBuilt;
-                    handleGlobal.mapTable[handleGlobal.mapTableCnt].node = n;
-
-                    // Build the actor queue.
-                    if (n == handleGlobal.rank) 
-                    {
-                        (*pActor) = (Actor*)malloc(sizeof(Actor));
-                        (*pActor)->actorID = handleGlobal.mapTable[handleGlobal.mapTableCnt].actorID;
-                        (*pActor)->categorySeq = handleGlobal.mapTable[handleGlobal.mapTableCnt].categorySeq;
-                        memcpy((*pActor)->category,handleGlobal.mapTable[handleGlobal.mapTableCnt].category, 10);
-                        (*pActor)->pActorData = NULL;
-                        (*pActor)->msgQueue.head = 0;
                         (*pActor)->msgQueue.tail = 0;
                         (*pActor)->pNext = NULL;
                         (*pActor)->step = 0;
                         (*pActor)->state = AS_Ready;
                         pActor = &(*pActor)->pNext ;
-                        (*pActor)->Init(NULL,0);                        
+                        (*pActor)->Init((*pActor),NULL,0);                        
                     }
                     handleGlobal.mapTableCnt++;
                     handleGlobal.actorinNode[n]++;
+
                 }
-            }  
+            }
         }
         else if (pDesc->method == AM_OnePerNode)
         {
@@ -420,7 +280,7 @@ int BuildMapTable()
                     (*pActor)->step = 0;
                     (*pActor)->state = AS_Ready;
                     pActor = &(*pActor)->pNext;
-                    (*pActor)->Init(NULL,0);                        
+                    (*pActor)->Init((*pActor),NULL,0);                        
                 }
                 handleGlobal.mapTableCnt++;
                 handleGlobal.actorinNode[n]++;
@@ -441,6 +301,9 @@ int InitActorFramework(int argc, char *argv[])
  
     // Call MPI initialize first
     MPI_Init(&argc, &argv);
+    handleGlobal.commBuffer = malloc(512*1024);
+
+    MPI_Buffer_attach(handleGlobal.commBuffer, 512*1024);
 
 	MPI_Comm_rank(MPI_COMM_WORLD, &handleGlobal.rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &handleGlobal.ranksize);
@@ -448,6 +311,7 @@ int InitActorFramework(int argc, char *argv[])
     //Build the maptable and the actor queue
     if (BuildMapTable() == 0)
     {
+        handleGlobal.commBuffer = malloc(512*1024);
         MPI_Finalize();
         return 0;
     }
@@ -456,6 +320,7 @@ int InitActorFramework(int argc, char *argv[])
 
     if (statusCode == 0)     
     {
+        handleGlobal.commBuffer = malloc(512*1024);
         MPI_Finalize();
         return 0;
     }
@@ -467,6 +332,7 @@ int InitActorFramework(int argc, char *argv[])
     {
         MPI_Type_free(&AF_ACTOR_TYPE);
     	MPI_Type_free(&AF_CNTL_TYPE);
+        handleGlobal.commBuffer = malloc(512*1024);
         MPI_Finalize();
         return 0;
     }
@@ -476,25 +342,86 @@ int InitActorFramework(int argc, char *argv[])
 }
 
 
-typedef struct _ActorNew
-{
-    NodeMappingTable info;
-    unsigned char data[16];
-} ActorNew;
 
 int GetAvailiableNode(ActorDesc *pDesc)
 {
-    int count;
+    int count, selnode=0;
     if (pDesc->method == AM_Even)
     {
         count = pDesc->actorlimit;
-        for (int i=0 ; i<handleGlobal.activeNodeCnt ; i++) 
+        for (int i=1 ; i<=handleGlobal.activeNodeCnt ; i++)
         {
-            if (handleGlobal.actorinNode[])
+            if (handleGlobal.actorinNode[i] < count)
+            {
+                count = handleGlobal.actorinNode[i];
+                selnode = i;
+            }
+        }
+        if (selnode == 0)
+        {
+            if (handleGlobal.activeNodeCnt < (handleGlobal.ranksize - 1))
+                selnode = -1;
+        }
+    }
+    else if (pDesc->method == AM_OnePerNode)
+    {
+        for (int i=1 ; i<=handleGlobal.activeNodeCnt ; i++)
+        {
+            if (handleGlobal.actorinNode[i] == 0)
+                selnode = i;
+        }
+        if (selnode == 0)
+        {
+            if (handleGlobal.activeNodeCnt < (handleGlobal.ranksize - 1))
+                selnode = -1;
+        }
+    }
 
+    return selnode;
+
+}
+
+NodeMappingTable *AddMapTable(int node, ActorDesc *pDesc)
+{
+    NodeMappingTable *pMap;
+    pDesc->actorsBuilt++;
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].actorID = node << 16 + handleGlobal.mapTableCnt + 1;
+    memcpy(handleGlobal.mapTable[handleGlobal.mapTableCnt].category, pDesc->category, 10);
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].categorySeq = pDesc->actorsBuilt;
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].node = node;
+
+    handleGlobal.mapTableCnt++;
+    handleGlobal.actorinNode[node]++;
+
+    pMap = &handleGlobal.mapTable[handleGlobal.mapTableCnt];
+
+    return pMap;
+}
+
+void AppendMappingTable(NodeMappingTable *pMap, ActorDesc *pDesc)
+{
+    pDesc->actorsBuilt++;
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].actorID = pMap->actorID;
+    memcpy(handleGlobal.mapTable[handleGlobal.mapTableCnt].category, pMap->category, 10);
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].categorySeq = pMap->categorySeq;
+    handleGlobal.mapTable[handleGlobal.mapTableCnt].node = pMap->node;
+
+    handleGlobal.mapTableCnt++;
+    handleGlobal.actorinNode[pMap->node]++;
+}
+
+void RemoveMappingTable(int actorID)
+{
+    for (int i =0 ; i< handleGlobal.mapTableCnt; i++)
+    {
+        if (handleGlobal.mapTable[i].actorID == actorID)
+        {
+            handleGlobal.mapTable[i].actorID = 0;
+            handleGlobal.actorinNode[handleGlobal.mapTable[i].node]--;
         }
     }
 }
+
 
 int CreateActor(ActorNew *pnewActor)
 {
@@ -505,10 +432,53 @@ int CreateActor(ActorNew *pnewActor)
             pDesc = &handleGlobal.actorinfo[i];
     if (pDesc != NULL)
     {
+        if (handleGlobal.rank == 0)
+        {
+            int node = pnewActor->info.node ;
+            if (node == 0)
+            {
+                node = GetAvailiableNode(pDesc);
+                if (node == -1)
+                {
+                    node = startWorkerProcess();
+                }
+            }
+            if (node > 0)
+            {
+                NodeMappingTable *pMap = AddMapTable(node, pDesc);
+                ActorNew data;
+                data.info = *pMap;
+                memcpy(data.data, pnewActor->data, 16);
+                int result = BroadcastCntlMessage(FM_ActorNew, 0, &data, sizeof(ActorNew));
+            }
+        }  
+        else
+        {
+            AppendMappingTable(&pnewActor->info, pDesc);
+            if (pnewActor->info.node == handleGlobal.rank)
+            {
+                Actor **pActor = &handleGlobal.pActorQueue;
+                while ((*pActor) != NULL)
+                    pActor = &(*pActor)->pNext;
+
+                (*pActor) = (Actor *)malloc(sizeof(Actor));
+                (*pActor)->actorID = pnewActor->info.actorID;
+                (*pActor)->categorySeq = pnewActor->info.categorySeq;
+                memcpy((*pActor)->category, pnewActor->info.category, 10);
+                (*pActor)->pActorData = NULL;
+                (*pActor)->msgQueue.head = 0;
+                (*pActor)->msgQueue.tail = 0;
+                (*pActor)->pNext = NULL;
+                (*pActor)->step = 0;
+                pActor = &(*pActor)->pNext;
+                (*pActor)->Init((*pActor),pnewActor->data, 16);
+                (*pActor)->state = AS_Running;
+            }
+            return 1;
+        }
     }
-
+    return 0;
 }
-
 
 int ProcessFrameworkMessage(int rank, FrameMessage *pMsg)
 {
@@ -516,13 +486,60 @@ int ProcessFrameworkMessage(int rank, FrameMessage *pMsg)
     {
         switch (pMsg->msgType)
         {
-            case FM_ActorNew:
-                CreateActor(&pMsg->data);
+        case FM_ActorNew:
+            CreateActor((ActorNew *)&pMsg->data);
+            break;
+        case FM_ActorDie:
+            RemoveMappingTable(pMsg->targetActor);
+            BroadcastCntlMessage(FM_ActorDie, pMsg->targetActor,NULL,0 ) ;
         }
     }
     else
     {
-        d
+        switch (pMsg->msgType)
+        {
+        case FM_ActorNew:
+            CreateActor((ActorNew *)&pMsg->data);
+            break;
+        case FM_ActorRun:
+            if (pMsg->targetActor == 0 || pMsg->targetActor >> 16 == handleGlobal.rank)
+            {
+                Actor **pActor = &handleGlobal.pActorQueue;
+                while ((*pActor) != NULL)
+                {
+                    (*pActor)->state = AS_Running;
+                    pActor = &(*pActor)->pNext;
+ 
+                }
+            }
+            else 
+            {
+                Actor **pActor = &handleGlobal.pActorQueue;
+                while ((*pActor) != NULL && pMsg->targetActor != (*pActor)->actorID)
+                {
+                    pActor = &(*pActor)->pNext;
+                }
+                if ((*pActor) != NULL)  (*pActor)->state = AS_Running;
+            }
+        case FM_ActorDie:
+            if (pMsg->targetActor >> 16 == handleGlobal.rank)
+            {
+                Actor **pActor = &handleGlobal.pActorQueue;
+                while ((*pActor) != NULL && pMsg->targetActor != (*pActor)->actorID)
+                {
+                    pActor = &(*pActor)->pNext;
+                }
+                if ((*pActor) != NULL)
+                {
+                    (*pActor)->state = AS_Stopped;
+                    if ((*pActor)->pActorData != NULL)  free((*pActor)->pActorData);
+                    Actor *pDel = (*pActor);
+                    (*pActor) = (*pActor)->pNext;
+                    free(pDel); 
+                } 
+            } 
+            RemoveMappingTable(pMsg->targetActor);         
+        }
     }
 
     return 1;
@@ -531,10 +548,11 @@ int ProcessFrameworkMessage(int rank, FrameMessage *pMsg)
 Actor *SearchActor(int actorID)
 {
     Actor *pActor = handleGlobal.pActorQueue;
-    while (pActor == NULL)
+    while (pActor != NULL)
     {
         if (pActor->actorID != actorID)     pActor = pActor->pNext;
-        else break;
+        else
+            break;
     }
 
     return pActor;
@@ -550,14 +568,16 @@ int DispatchActorMessage(int rank, ActorMessage *pMsg)
             pActor = SearchActor(pMsg->rcvActorID);
             if (pActor != NULL)
             {
-                pActor->msgQueue.msg[pActor->msgQueue.head] = *pMsg;
-                pActor->msgQueue.head++;
-                if (pActor->msgQueue.tail == -1)    pActor->msgQueue.tail=0;
+                int point = (pActor->msgQueue.head + 1) % ACTOR_MSGQUEUE_LEN;
+                if (point != pActor->msgQueue.tail) 
+                {
+                    pActor->msgQueue.msg[point] = *pMsg;
+                    pActor->msgQueue.head = point;
+                }
                 return 1;
             }
         }
     }
-
     return 0;
 }
 
@@ -568,25 +588,27 @@ int FrameworkPoll()
     if (cntlRequest == NULL)
         MPI_Irecv(&cntlMessage, 1, AF_CNTL_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &cntlRequest);
     if (cntlBcastRequest == NULL)
-        MPI_Irecv(&cntlBcastMessage, 1, AF_CNTL_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &cntlBcastRequest);
+        MPI_Ibcast(&cntlBcastMessage, 1, AF_CNTL_TYPE, 0, MPI_COMM_WORLD, &cntlBcastRequest);
 
     MPI_Test(&cntlRequest, &flag, &status);
-    if (flag)   
+    while (flag)   
     {
         ProcessFrameworkMessage(handleGlobal.rank, &cntlMessage);
         MPI_Irecv(&cntlMessage, 1, AF_CNTL_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &cntlRequest);
+        MPI_Test(&cntlRequest, &flag, &status);
     }
     MPI_Test(&cntlBcastRequest, &flag, &status);
-    if (flag)   
+    while (flag)   
     {
         ProcessFrameworkMessage(handleGlobal.rank, &cntlBcastMessage);
-        MPI_Irecv(&cntlBcastMessage, 1, AF_CNTL_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &cntlBcastRequest);
+        MPI_Ibcast(&cntlBcastMessage, 1, AF_CNTL_TYPE, 0, MPI_COMM_WORLD, &cntlBcastRequest);
+        MPI_Test(&cntlBcastRequest, &flag, &status);
     }
 
     if (actorRequest == NULL)
         MPI_Irecv(&actorMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_ACTORMSG_TAG, MPI_COMM_WORLD, &actorRequest);
-    if (cntlRequest == NULL)
-        MPI_Irecv(&actorBcastMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_ACTORMSG_TAG, MPI_COMM_WORLD, &actorBcastRequest);
+//    if (cntlRequest == NULL)
+//        MPI_Irecv(&actorBcastMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_ACTORMSG_TAG, MPI_COMM_WORLD, &actorBcastRequest);
 
     MPI_Test(&actorRequest, &flag, &status);
     while (flag)   
@@ -595,20 +617,39 @@ int FrameworkPoll()
         MPI_Irecv(&actorMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &actorRequest);
         MPI_Test(&actorRequest, &flag, &status);
     }
-    MPI_Test(&actorBcastRequest, &flag, &status);
-    while (flag)   
-    {
-        DispatchActorMessage(handleGlobal.rank, &actorBcastMessage);
-        MPI_Irecv(&actorBcastMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &actorBcastRequest);
-        MPI_Test(&actorBcastRequest, &flag, &status);
-    }
-    
-
-
-    
+//    MPI_Test(&actorBcastRequest, &flag, &status);
+//    while (flag)   
+//    {
+//        DispatchActorMessage(handleGlobal.rank, &actorBcastMessage);
+//        MPI_Irecv(&actorBcastMessage, 1, AF_ACTOR_TYPE, MPI_ANY_SOURCE, AF_CONTROL_TAG, MPI_COMM_WORLD, &actorBcastRequest);
+//        MPI_Test(&actorBcastRequest, &flag, &status);
+//    }
+    return 1;
 }
 
 
+int ActorRun()
+{
+    Actor **pActor = &handleGlobal.pActorQueue;
+    while ((*pActor) != NULL)
+    {
+        if ((*pActor)->state == AS_Running)   
+        {
+             (*pActor)->Run(*pActor);
+             (*pActor)->step ++;
+        }
+        if ((*pActor)->state == AS_Stopped)
+        {
+            if ((*pActor)->pActorData != NULL)     free((*pActor)->pActorData);
+            RemoveMappingTable((*pActor)->actorID);
+
+            Actor *pDel = (*pActor);
+            (*pActor) = (*pActor)->pNext;
+            SendCntlMessage(FM_ActorDie, 0, pDel->actorID, NULL , 0 ) ;
+            free(pDel);
+        }
+    }
+}
 
 int RunFramework()
 {
@@ -637,7 +678,8 @@ int RunFramework()
 		int masterStatus = masterPoll();
 		while (masterStatus) {
             masterStatus = masterPoll();
-            masterStatus = FrameworkPoll();
+            int result = FrameworkPoll();
+            result = ActorRun();
 
             for (i = 0; i < handleGlobal.activeNodeCnt; i++)
             {
@@ -649,6 +691,8 @@ int RunFramework()
                         activeWorkers--;
                 }
             }
+
+       
             // If we have no more active workers then quit poll loop which will effectively shut the pool down when  processPoolFinalise is called
             if (activeWorkers == 0)
                 break;
@@ -659,21 +703,3 @@ int RunFramework()
     // Finalize MPI, ensure you have closed the process pool first
     MPI_Finalize();
 }
-
-int BroadcastMessage()
-{
-
-    return 0;
-}
-
-int SendMessagetoActor()
-{
-    return 1;
-}
-
-int FinalizeActorFramwork()
-{
-    return 1;
-}
-
-
